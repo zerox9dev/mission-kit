@@ -84,7 +84,7 @@ A red gate means the worker fixes it before the step can close.
 
 - **Billing.** It all runs in your normal Claude Code session, on your subscription. One gotcha: if `ANTHROPIC_API_KEY` is exported, Claude Code bills that key per-token instead of your sub. `unset` it. (`mission check` will tell you.)
 - **Rate limits.** A run fires a lot of subagent calls. Comfortable on Max, tight on Pro.
-- **Commits.** Each verified step gets committed with `git add -A`, so start runs from a clean tree or unrelated changes get swept in. Set `MISSION_COMMIT=0` to turn it off.
+- **Commits.** Each verified step gets committed. The kit's own install files are excluded automatically, but any other uncommitted change in the tree gets swept into the step commit, so start runs from a clean tree. Set `MISSION_COMMIT=0` to turn it off.
 
 ## Not built yet
 

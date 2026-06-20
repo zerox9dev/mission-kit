@@ -21,7 +21,7 @@ set -uo pipefail
 
 MISSIONS_DIR="${MISSION_DIR:-missions}"
 QUEUE="$MISSIONS_DIR/_queue.md"
-KIT_VERSION="0.2.0"
+KIT_VERSION="0.2.1"
 GATE="${GATE_CMD:-}"
 
 c_red() { printf '\033[31m%s\033[0m' "$1"; }
@@ -183,10 +183,19 @@ cmd_commit_step() {
   local slug="${1:-}" step="${2:-}" title="${3:-}"
   [ -n "$slug" ] && [ -n "$step" ] || die "usage: mission commit-step <slug> <step> <title>"
   [ "${MISSION_COMMIT:-1}" = "1" ] || { info "commit disabled (MISSION_COMMIT=0)"; return 0; }
-  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { info "not a git repo — skipping commit"; return 0; }
-  git add -A
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { info "not a git repo, skipping commit"; return 0; }
+  # Stage the worker's changes but never the kit's own install (the install
+  # leaves these dirty, and they don't belong in a feature commit). missions/
+  # is gitignored already; .gitignore itself is left for the user to commit.
+  git add -A -- . \
+    ':!.gitignore' \
+    ':!.claude/agents' \
+    ':!.claude/commands' \
+    ':!.claude/hooks/gate.sh' \
+    ':!.claude/mission-kit' \
+    ':!.claude/settings.json' 2>/dev/null || git add -A
   git diff --cached --quiet && { info "nothing to commit for $step"; return 0; }
-  git commit -q -m "mission($slug): step $step — $title [verified]" \
+  git commit -q -m "mission($slug): step $step $title [verified]" \
     && info "committed $(c_dim "$step")"
 }
 
@@ -212,6 +221,22 @@ cmd_coverage() {
   else
     printf 'covered: all\n'
   fi
+}
+
+# --------------------------------------------------------------------------
+# queue-set <slug> <status>  — sync the status cell for a slug in _queue.md
+# --------------------------------------------------------------------------
+cmd_queue_set() {
+  local slug="${1:-}" st="${2:-}" tmp
+  [ -n "$slug" ] && [ -n "$st" ] || die "usage: mission queue-set <slug> <status>"
+  [ -f "$QUEUE" ] || return 0
+  tmp="$(mktemp)"
+  awk -v s="$slug" -v st="$st" -F'|' '
+    {
+      f3=$3; gsub(/^[ \t]+|[ \t]+$/,"",f3)
+      if (f3==s && NF>=5) { $2=" " st " "; OFS="|"; $1=$1; print; next }
+      print
+    }' "$QUEUE" > "$tmp" && mv "$tmp" "$QUEUE"
 }
 
 # --------------------------------------------------------------------------
@@ -250,6 +275,7 @@ the deterministic bookkeeping:
   mission set <file> <key> <value>     write a frontmatter value
   mission gate                         run the objective gate
   mission commit-step <slug> <s> <t>   commit a verified step
+  mission queue-set <slug> <status>    update a mission's row in the queue
   mission coverage <slug>              report uncovered contract assertions
   mission check                        billing / environment sanity
 
@@ -268,6 +294,7 @@ main() {
     set)         cmd_set "$@" ;;
     gate)        cmd_gate "$@" ;;
     commit-step) cmd_commit_step "$@" ;;
+    queue-set)   cmd_queue_set "$@" ;;
     coverage)    cmd_coverage "$@" ;;
     check)       cmd_check "$@" ;;
     ""|help|-h|--help) usage ;;

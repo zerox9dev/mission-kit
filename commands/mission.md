@@ -29,7 +29,8 @@ Parse `$ARGUMENTS`. The first word selects the command.
 
 1. **Plan gate.** `"$M" get missions/<slug>/PLAN.md status` must be `approved`. If not, stop and tell the user to approve it.
 2. `"$M" coverage <slug>` — surface any uncovered assertions as a warning.
-3. Get the ordered step list: `"$M" steps <slug>`. For each step file `S` in order:
+3. Mark the mission running: `"$M" set missions/<slug>/MISSION.md status running` and `"$M" queue-set <slug> running`.
+4. Get the ordered step list: `"$M" steps <slug>`. For each step file `S` in order:
    - If `"$M" get "$S" status` is `done`, skip it.
    - `max = "$M" get "$S" max_iterations` (default 3). `iter = 1`.
    - Loop while `iter <= max`:
@@ -39,8 +40,8 @@ Parse `$ARGUMENTS`. The first word selects the command.
      4. **verifier** (Task, subagent_type `verifier`): read-only. Verify the step's change against its Spec and `asserts:`, cross-checking the worker's `## Handoff` against the actual `git diff HEAD`. It returns `VERDICT: PASS` or `VERDICT: FAIL` + bullets.
      5. If PASS: append the verdict to `$S`, `"$M" set "$S" status done`, then `"$M" commit-step <slug> <basename-of-S> "<step title>"`. Break out of the loop.
      6. If FAIL: append the verifier's full report to `$S` under an `### iteration $iter` heading so the next worker sees it. `iter=iter+1`.
-   - If the loop ends without a PASS (hit the cap): `"$M" set "$S" status blocked`, `"$M" set missions/<slug>/MISSION.md status blocked`. **Stop and escalate** — show the user the step path and the last verifier report, and do NOT continue to later steps.
-5. If every step is `done`: `"$M" set missions/<slug>/MISSION.md status done`. **Stop — human checkpoint #2.** Tell the user to review the full change and accept the mission.
+   - If the loop ends without a PASS (hit the cap): `"$M" set "$S" status blocked`, `"$M" set missions/<slug>/MISSION.md status blocked`, `"$M" queue-set <slug> blocked`. **Stop and escalate** — show the user the step path and the last verifier report, and do NOT continue to later steps.
+5. If every step is `done`: `"$M" set missions/<slug>/MISSION.md status done` and `"$M" queue-set <slug> done`. **Stop — human checkpoint #2.** Tell the user to review the full change and accept the mission.
 
 ## `status`
 
