@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+#
+# mission — state & bookkeeping helper for the mission-kit loop.
+#
+# This script does NOT call any LLM. Orchestration happens inside a normal
+# Claude Code session (the /mission slash command), which delegates to the
+# planner/worker/verifier subagents via the Task tool and calls this helper
+# for the deterministic parts: scaffolding, frontmatter, the gate, commits.
+#
+#   mission new "<task>"            scaffold missions/<slug>/ from templates
+#   mission status                  show the queue
+#   mission steps <slug>            list step files in run order
+#   mission get <file> <key>        read a frontmatter value
+#   mission set <file> <key> <val>  write a frontmatter value
+#   mission gate                    run the objective gate (exit code passthru)
+#   mission commit-step <slug> <step> <title>   git-commit a verified step
+#   mission coverage <slug>         print contract assertions no step covers
+#   mission check                   sanity: gate present, not billing per-token
+
+set -uo pipefail
+
+MISSIONS_DIR="${MISSION_DIR:-missions}"
+QUEUE="$MISSIONS_DIR/_queue.md"
+KIT_VERSION="0.2.0"
+GATE="${GATE_CMD:-}"
+
+c_red() { printf '\033[31m%s\033[0m' "$1"; }
+c_grn() { printf '\033[32m%s\033[0m' "$1"; }
+c_ylw() { printf '\033[33m%s\033[0m' "$1"; }
+c_dim() { printf '\033[2m%s\033[0m' "$1"; }
+die()   { printf '%s %s\n' "$(c_red 'error:')" "$1" >&2; exit 1; }
+info()  { printf '%s %s\n' "$(c_dim '·')" "$1"; }
+
+# --------------------------------------------------------------------------
+# YAML frontmatter helpers (operate only on the leading --- block)
+# --------------------------------------------------------------------------
+fm_get() {
+  awk -v k="$2" '
+    NR==1 && $0=="---" {inblk=1; next}
+    inblk && $0=="---" {exit}
+    inblk {
+      idx=index($0, ":")
+      if (idx>0) {
+        key=substr($0,1,idx-1); gsub(/^[ \t]+|[ \t]+$/,"",key)
+        if (key==k) {
+          val=substr($0,idx+1); gsub(/^[ \t]+|[ \t]+$/,"",val)
+          sub(/[ \t]*#.*$/,"",val); gsub(/[ \t]+$/,"",val)
+          print val; exit
+        }
+      }
+    }' "$1"
+}
+
+fm_set() {
+  local file="$1" key="$2" val="$3" tmp; tmp="$(mktemp)"
+  awk -v k="$key" -v v="$val" '
+    NR==1 && $0=="---" {inblk=1; print; next}
+    inblk && $0=="---" {inblk=0; print; next}
+    inblk {
+      idx=index($0, ":")
+      if (idx>0) {
+        key=substr($0,1,idx-1); g=key; gsub(/^[ \t]+|[ \t]+$/,"",g)
+        if (g==k) { print key ": " v; next }
+      }
+      print; next
+    }
+    {print}
+  ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+slugify() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-50
+}
+sed_repl_escape() { printf '%s' "$1" | sed -e 's/[\/&]/\\&/g'; }
+today() { date +%Y-%m-%d; }
+
+resolve_gate() {
+  [ -n "$GATE" ] && return 0
+  for c in ".claude/hooks/gate.sh" "hooks/gate.sh"; do
+    [ -x "$c" ] && { GATE="$c"; return 0; }
+  done
+  command -v gate.sh >/dev/null 2>&1 && { GATE="gate.sh"; return 0; }
+  GATE=""
+}
+
+find_template() {
+  for c in ".claude/mission-kit/templates/$1" "templates/$1"; do
+    [ -f "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+# --------------------------------------------------------------------------
+# new
+# --------------------------------------------------------------------------
+cmd_new() {
+  local title="${1:-}"
+  [ -n "$title" ] || die "usage: mission new \"<task description>\""
+  local slug date dir
+  slug="$(slugify "$title")"; date="$(today)"; dir="$MISSIONS_DIR/$date-$slug"
+  [ -e "$dir" ] && die "mission already exists: $dir"
+  mkdir -p "$dir/steps"
+
+  local mtpl ptpl etitle
+  mtpl="$(find_template MISSION.md)" || die "MISSION.md template not found (run install.sh?)"
+  ptpl="$(find_template PLAN.md)"    || die "PLAN.md template not found"
+  etitle="$(sed_repl_escape "$title")"
+
+  sed -e "s/^slug: .*/slug: $date-$slug/" \
+      -e "s/^title: .*/title: $etitle/" \
+      -e "s/^created: .*/created: $date/" \
+      -e "s/^kit_version: .*/kit_version: $KIT_VERSION/" \
+      -e "s/^# Mission: TITLE/# Mission: $etitle/" \
+      -e "s/^GOAL$/$etitle/" \
+      "$mtpl" > "$dir/MISSION.md"
+
+  sed -e "s/^slug: .*/slug: $date-$slug/" \
+      -e "s/^created: .*/created: $date/" \
+      -e "s/^kit_version: .*/kit_version: $KIT_VERSION/" \
+      -e "s/^# Plan: TITLE/# Plan: $etitle/" \
+      "$ptpl" > "$dir/PLAN.md"
+
+  printf '# Log: %s\n\n- %s  mission created\n' "$title" "$date" > "$dir/LOG.md"
+
+  mkdir -p "$MISSIONS_DIR"
+  [ -f "$QUEUE" ] || printf '# Mission queue\n\n| status | slug | title |\n|---|---|---|\n' > "$QUEUE"
+  printf '| planning | %s | %s |\n' "$date-$slug" "$title" >> "$QUEUE"
+
+  info "created $(c_grn "$dir")"
+  printf 'SLUG=%s\n' "$date-$slug"   # machine-readable for the orchestrator
+}
+
+# --------------------------------------------------------------------------
+# status
+# --------------------------------------------------------------------------
+cmd_status() {
+  if [ -f "$QUEUE" ]; then cat "$QUEUE"
+  else info "no missions yet. Create one with: mission new \"<task>\""; fi
+}
+
+# --------------------------------------------------------------------------
+# steps <slug>  — print step files in run order, one per line
+# --------------------------------------------------------------------------
+cmd_steps() {
+  local slug="${1:-}"; [ -n "$slug" ] || die "usage: mission steps <slug>"
+  local dir="$MISSIONS_DIR/$slug"
+  [ -d "$dir/steps" ] || die "no steps dir: $dir/steps"
+  local s found=0
+  for s in "$dir"/steps/*.md; do [ -e "$s" ] || continue; printf '%s\n' "$s"; found=1; done
+  [ "$found" = "1" ] || die "no step files in $dir/steps (did the planner run?)"
+}
+
+# --------------------------------------------------------------------------
+# get / set  — frontmatter access
+# --------------------------------------------------------------------------
+cmd_get() {
+  local file="${1:-}" key="${2:-}"
+  [ -n "$file" ] && [ -n "$key" ] || die "usage: mission get <file> <key>"
+  [ -f "$file" ] || die "no such file: $file"
+  fm_get "$file" "$key"
+}
+cmd_set() {
+  local file="${1:-}" key="${2:-}" val="${3:-}"
+  [ -n "$file" ] && [ -n "$key" ] || die "usage: mission set <file> <key> <value>"
+  [ -f "$file" ] || die "no such file: $file"
+  fm_set "$file" "$key" "$val"
+}
+
+# --------------------------------------------------------------------------
+# gate  — run the objective gate, pass its exit code through
+# --------------------------------------------------------------------------
+cmd_gate() {
+  resolve_gate
+  [ -n "$GATE" ] || { info "$(c_ylw 'warning:') no gate.sh found — skipping objective gate."; return 0; }
+  "$GATE"
+}
+
+# --------------------------------------------------------------------------
+# commit-step <slug> <step-basename> <title>
+# --------------------------------------------------------------------------
+cmd_commit_step() {
+  local slug="${1:-}" step="${2:-}" title="${3:-}"
+  [ -n "$slug" ] && [ -n "$step" ] || die "usage: mission commit-step <slug> <step> <title>"
+  [ "${MISSION_COMMIT:-1}" = "1" ] || { info "commit disabled (MISSION_COMMIT=0)"; return 0; }
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { info "not a git repo — skipping commit"; return 0; }
+  git add -A
+  git diff --cached --quiet && { info "nothing to commit for $step"; return 0; }
+  git commit -q -m "mission($slug): step $step — $title [verified]" \
+    && info "committed $(c_dim "$step")"
+}
+
+# --------------------------------------------------------------------------
+# coverage <slug>  — print contract assertions not covered by any step
+# --------------------------------------------------------------------------
+cmd_coverage() {
+  local slug="${1:-}"; [ -n "$slug" ] || die "usage: mission coverage <slug>"
+  local dir="$MISSIONS_DIR/$slug" contract steps_asserts a s missing=""
+  [ -f "$dir/MISSION.md" ] || die "no MISSION.md in $dir"
+  contract="$(grep -oE '^- A[0-9]+' "$dir/MISSION.md" 2>/dev/null | sed 's/^- //' | sort -u)"
+  [ -n "$contract" ] || { info "no validation contract found in $dir/MISSION.md"; return 0; }
+  steps_asserts=""
+  for s in "$dir"/steps/*.md; do
+    [ -e "$s" ] || continue
+    steps_asserts="$steps_asserts $(fm_get "$s" asserts | grep -oE 'A[0-9]+' | tr '\n' ' ')"
+  done
+  for a in $contract; do
+    case " $steps_asserts " in *" $a "*) ;; *) missing="$missing $a";; esac
+  done
+  if [ -n "$missing" ]; then
+    printf '%s\n' "uncovered:$missing"
+  else
+    printf 'covered: all\n'
+  fi
+}
+
+# --------------------------------------------------------------------------
+# check  — billing / environment sanity
+# --------------------------------------------------------------------------
+cmd_check() {
+  local ok=1
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    printf '%s ANTHROPIC_API_KEY is set — Claude Code will bill pay-per-token\n' "$(c_red '⚠')"
+    printf '   instead of using your subscription. An autonomous loop fires many\n'
+    printf '   requests; this can run up a large bill. To use your subscription:\n'
+    printf '       unset ANTHROPIC_API_KEY\n'
+    ok=0
+  else
+    printf '%s ANTHROPIC_API_KEY not set (subscription billing)\n' "$(c_grn '✓')"
+  fi
+  resolve_gate
+  [ -n "$GATE" ] && printf '%s gate: %s\n' "$(c_grn '✓')" "$GATE" \
+                 || printf '%s no gate.sh found\n' "$(c_ylw '!')"
+  [ "$ok" = "1" ]
+}
+
+# --------------------------------------------------------------------------
+usage() {
+  cat <<EOF
+mission-kit v$KIT_VERSION — state helper for the in-session multi-role loop
+
+The loop runs inside Claude Code via the /mission slash command, which
+delegates to the planner/worker/verifier subagents. This script only does
+the deterministic bookkeeping:
+
+  mission new "<task>"                 scaffold a mission folder
+  mission status                       show the queue
+  mission steps <slug>                 list step files in run order
+  mission get <file> <key>             read a frontmatter value
+  mission set <file> <key> <value>     write a frontmatter value
+  mission gate                         run the objective gate
+  mission commit-step <slug> <s> <t>   commit a verified step
+  mission coverage <slug>              report uncovered contract assertions
+  mission check                        billing / environment sanity
+
+env: MISSION_DIR (default: missions), GATE_CMD (autodetect),
+     MISSION_COMMIT=0 to disable per-step commits.
+EOF
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    new)         cmd_new "$@" ;;
+    status)      cmd_status "$@" ;;
+    steps)       cmd_steps "$@" ;;
+    get)         cmd_get "$@" ;;
+    set)         cmd_set "$@" ;;
+    gate)        cmd_gate "$@" ;;
+    commit-step) cmd_commit_step "$@" ;;
+    coverage)    cmd_coverage "$@" ;;
+    check)       cmd_check "$@" ;;
+    ""|help|-h|--help) usage ;;
+    *) die "unknown command: $cmd (try: mission help)" ;;
+  esac
+}
+
+main "$@"
