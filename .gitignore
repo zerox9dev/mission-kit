@@ -1,2 +1,6 @@
 # mission-kit develops the tool; mission state belongs in target projects only
 missions/
+
+# Claude Code (локально, не коммитим)
+.claude/settings.local.json
+.claude/memory/
